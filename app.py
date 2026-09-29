@@ -1,29 +1,19 @@
-# =====================================================================
-# Interactive Generative Poster - spiky "vivid" style (Colab)
-# All controls are matplotlib sliders/buttons drawn under the poster
-# Left-click = add blob | Right-click = remove nearest clicked blob
-# Setup: !pip install -q -U ipympl ipywidgets -> restart runtime -> run this
-# =====================================================================
-from google.colab import output
-output.enable_custom_widget_manager()
-get_ipython().run_line_magic("matplotlib", "widget")
-
-import random
 import numpy as np
+import streamlit as st
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon
-from matplotlib.widgets import Slider, Button
+from PIL import Image
+import io
+from streamlit_image_coordinates import streamlit_image_coordinates
 
-# ---------------------------------------------------------------------
-# 1. CONFIG
-# ---------------------------------------------------------------------
+st.set_page_config(page_title="Interactive Generative Poster", layout="wide")
+
+# ---------------- CONFIG ----------------
 POSTER_W, POSTER_H = 100, 133
-N_BLOBS      = 12
-BLOB_ALPHA   = 0.55
-N_POINTS     = 240
-SPIKE_AMOUNT = 0.55            # higher = sharper spikes
-
-DEFAULTS = {"layers": 11, "wobble": 0.23, "palette": 1, "seed": 1210}
+N_BLOBS, BLOB_ALPHA, N_POINTS, SPIKE_AMOUNT = 12, 0.55, 240, 0.55
+FIG_W, FIG_H, DPI = 6, 8, 100          # 600 x 800 px preview
 
 PALETTES = {
     "pastel": ["#f4c2d7", "#c9e4de", "#dbcdf0", "#faedcb", "#c6def1", "#d0e6a5"],
@@ -34,16 +24,8 @@ PALETTES = {
 BACKGROUNDS = {"pastel": "#ffffff", "vivid": "#ffffff",
                "ocean": "#f8fbff", "sunset": "#1b1030"}
 DARK_BG = {"#1b1030"}
-PALETTE_NAMES = list(PALETTES)
 
-# ---------------------------------------------------------------------
-# 2. STATE
-# ---------------------------------------------------------------------
-clicked_blobs = []
-
-# ---------------------------------------------------------------------
-# 3. FUNCTIONS YOU CAN MODIFY
-# ---------------------------------------------------------------------
+# ---------------- FUNCTIONS YOU CAN MODIFY ----------------
 def base_blobs(seed, n=N_BLOBS):
     rng = np.random.default_rng(seed)
     return [{
@@ -54,8 +36,8 @@ def base_blobs(seed, n=N_BLOBS):
         "color_offset": int(rng.integers(0, 6)),
     } for _ in range(n)]
 
-def make_click_blob(x, y, seed):
-    rng = np.random.default_rng(seed + len(clicked_blobs) * 97 + 1)
+def make_click_blob(x, y, seed, k):
+    rng = np.random.default_rng(seed + k * 97 + 1)
     return {"cx": float(x), "cy": float(y),
             "r": float(rng.uniform(10, 22)),
             "seed": int(rng.integers(0, 10**6)),
@@ -74,120 +56,71 @@ def blob_outline(cx, cy, r, wobble, seed):
 
 def layer_style(blob, i, n_layers, colors):
     scale = 1.0 - 0.8 * (i / max(n_layers, 1))
-    color = colors[(blob["color_offset"] + i) % len(colors)]
-    return scale, color
+    return scale, colors[(blob["color_offset"] + i) % len(colors)]
 
-def draw_poster(ax, layers, wobble, palette, seed):
-    ax.clear()
+def render_poster(layers, wobble, palette, seed, clicked, dpi=DPI):
     colors, bg = PALETTES[palette], BACKGROUNDS[palette]
+    fig = plt.figure(figsize=(FIG_W, FIG_H), dpi=dpi)
+    ax = fig.add_axes([0, 0, 1, 1])
     ax.set_facecolor(bg)
     ax.set_xlim(0, POSTER_W); ax.set_ylim(0, POSTER_H)
-    ax.set_aspect("equal", adjustable="box")
-    ax.set_xticks([]); ax.set_yticks([])
-    for sp in ax.spines.values():
-        sp.set_visible(False)
-    for b in base_blobs(seed) + clicked_blobs:
+    ax.set_aspect("auto")              # keeps pixel->poster mapping exact
+    ax.axis("off")
+    for b in base_blobs(seed) + clicked:
         for i in range(layers):
             scale, color = layer_style(b, i, layers, colors)
             x, y = blob_outline(b["cx"], b["cy"], b["r"] * scale, wobble, b["seed"] + i)
             ax.add_patch(Polygon(np.column_stack([x, y]), closed=True,
                                  facecolor=color, edgecolor="none", alpha=BLOB_ALPHA))
-    ax.text(3, POSTER_H - 4, f"Interactive Poster • {palette}",
-            fontsize=12, fontweight="bold", va="top",
+    ax.text(3, POSTER_H - 4, f"Interactive Poster • {palette}", fontsize=13,
+            fontweight="bold", va="top",
             color="white" if bg in DARK_BG else "black")
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, facecolor=bg)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
 
-# ---------------------------------------------------------------------
-# 4. FIGURE + CONTROLS (sliders under the poster)
-# ---------------------------------------------------------------------
-fig = plt.figure(figsize=(7, 10))
-try:
-    fig.canvas.header_visible = False
-except Exception:
-    pass
+# ---------------- STATE ----------------
+ss = st.session_state
+ss.setdefault("blobs", [])
+ss.setdefault("last_click", None)
+ss.setdefault("seed", 1210)
 
-ax = fig.add_axes([0.05, 0.30, 0.90, 0.68])
+def random_seed():
+    ss.seed = int(np.random.randint(0, 10000))
 
-ax_layers  = fig.add_axes([0.20, 0.23, 0.55, 0.025])
-ax_wobble  = fig.add_axes([0.20, 0.19, 0.55, 0.025])
-ax_palette = fig.add_axes([0.20, 0.15, 0.55, 0.025])
-ax_seed    = fig.add_axes([0.20, 0.11, 0.55, 0.025])
+# ---------------- SIDEBAR CONTROLS ----------------
+st.sidebar.title("Controls")
+layers = st.sidebar.slider("Layers", 1, 20, 11)
+wobble = st.sidebar.slider("Wobble", 0.0, 1.0, 0.23, 0.01)
+palette = st.sidebar.selectbox("palette_mode", list(PALETTES), index=1)
+seed = st.sidebar.slider("Seed", 0, 9999, key="seed")
+st.sidebar.button("Random seed", on_click=random_seed)
 
-s_layers  = Slider(ax_layers,  "Layers",  1, 20, valinit=DEFAULTS["layers"], valstep=1, valfmt="%d")
-s_wobble  = Slider(ax_wobble,  "Wobble",  0.0, 1.0, valinit=DEFAULTS["wobble"], valstep=0.01)
-s_palette = Slider(ax_palette, "Palette", 0, len(PALETTE_NAMES) - 1,
-                   valinit=DEFAULTS["palette"], valstep=1, valfmt="%d")
-s_seed    = Slider(ax_seed,    "Seed",    0, 9999, valinit=DEFAULTS["seed"], valstep=1, valfmt="%d")
+c1, c2 = st.sidebar.columns(2)
+if c1.button("Undo last"):
+    if ss.blobs:
+        ss.blobs.pop()
+if c2.button("Clear clicks"):
+    ss.blobs = []
 
-ax_reset  = fig.add_axes([0.12, 0.03, 0.17, 0.045])
-ax_random = fig.add_axes([0.32, 0.03, 0.17, 0.045])
-ax_clear  = fig.add_axes([0.52, 0.03, 0.17, 0.045])
-ax_save   = fig.add_axes([0.72, 0.03, 0.17, 0.045])
-b_reset  = Button(ax_reset,  "Reset")
-b_random = Button(ax_random, "Random")
-b_clear  = Button(ax_clear,  "Clear")
-b_save   = Button(ax_save,   "Save PNG")
+# ---------------- MAIN: POSTER + CLICK ----------------
+st.title("Interactive Generative Poster")
+st.caption("Click on the poster to add a blob. Use Undo last / Clear clicks in the sidebar.")
 
-def settings():
-    return (int(s_layers.val), float(s_wobble.val),
-            PALETTE_NAMES[int(s_palette.val)], int(s_seed.val))
+png = render_poster(layers, wobble, palette, seed, ss.blobs)
+click = streamlit_image_coordinates(Image.open(io.BytesIO(png)), key="poster", use_column_width=False)
 
-def redraw(_=None):
-    layers, wobble, pal, seed = settings()
-    draw_poster(ax, layers, wobble, pal, seed)
-    s_palette.valtext.set_text(pal)          # show the name instead of the index
-    fig.canvas.draw_idle()
+if click:
+    sig = (click["x"], click["y"], click.get("unix_time"))
+    if sig != ss.last_click:                       # ignore the same click on reruns
+        ss.last_click = sig
+        px = click["x"] / click["width"] * POSTER_W
+        py = (1 - click["y"] / click["height"]) * POSTER_H
+        ss.blobs.append(make_click_blob(px, py, seed, len(ss.blobs)))
+        st.rerun()
 
-# ---------------------------------------------------------------------
-# 5. EVENTS
-# ---------------------------------------------------------------------
-def toolbar_active():
-    tb = getattr(fig.canvas, "toolbar", None)
-    return str(getattr(tb, "mode", "") or "") not in ("", "_Mode.NONE")
-
-def on_click(event):
-    if event.inaxes is not ax or event.xdata is None or toolbar_active():
-        return
-    if event.button == 1:
-        clicked_blobs.append(make_click_blob(event.xdata, event.ydata, int(s_seed.val)))
-    elif event.button == 3 and clicked_blobs:
-        d = [(b["cx"] - event.xdata) ** 2 + (b["cy"] - event.ydata) ** 2
-             for b in clicked_blobs]
-        clicked_blobs.pop(int(np.argmin(d)))
-    else:
-        return
-    redraw()
-
-def on_reset(_):
-    clicked_blobs.clear()
-    s_layers.set_val(DEFAULTS["layers"]); s_wobble.set_val(DEFAULTS["wobble"])
-    s_palette.set_val(DEFAULTS["palette"]); s_seed.set_val(DEFAULTS["seed"])
-    redraw()
-
-def on_random(_):
-    s_seed.set_val(random.randint(0, 9999))
-
-def on_clear(_):
-    clicked_blobs.clear()
-    redraw()
-
-def on_save(_):
-    from matplotlib.figure import Figure
-    out = Figure(figsize=(6, 8))
-    ax_out = out.add_axes([0, 0, 1, 1])
-    draw_poster(ax_out, *settings())
-    out.savefig("poster.png", dpi=200)
-    print("Saved poster.png (see the Files panel)")
-
-# ---------------------------------------------------------------------
-# 6. WIRING
-# ---------------------------------------------------------------------
-for s in (s_layers, s_wobble, s_palette, s_seed):
-    s.on_changed(redraw)
-b_reset.on_clicked(on_reset)
-b_random.on_clicked(on_random)
-b_clear.on_clicked(on_clear)
-b_save.on_clicked(on_save)
-fig.canvas.mpl_connect("button_press_event", on_click)
-
-redraw()
-plt.show()
+st.sidebar.write(f"Clicked blobs: {len(ss.blobs)}")
+hi_png = render_poster(layers, wobble, palette, seed, ss.blobs, dpi=200)
+st.sidebar.do
